@@ -1,0 +1,34 @@
+const express = require("express");
+const axios = require("axios");
+const { proxyRequest } = require("../helpers/proxy");
+
+const router = express.Router();
+
+const AUTH_SERVICE_URL = process.env.AUTH_SERVICE_URL || "http://localhost:3001";
+const AUTH_SERVICE_HEALTH = process.env.AUTH_SERVICE_HEALTH || `${AUTH_SERVICE_URL || "http://localhost:3001"}/health`;
+
+router.get("/health", async (_req, res) => {
+  try {
+    const response = await axios.get(AUTH_SERVICE_HEALTH, { validateStatus: () => true });
+    return res.status(response.status).json({
+      status: response.status >= 200 && response.status < 300 ? "ok" : "degraded",
+      authService: response.data,
+    });
+  } catch (error) {
+    return res.status(503).json({
+      status: "degraded",
+      message: "Auth Service is unavailable",
+    });
+  }
+});
+
+router.use(async (req, res) => {
+  return proxyRequest({
+    req,
+    res,
+    serviceUrl: AUTH_SERVICE_URL,
+    serviceName: "Auth",
+  });
+});
+
+module.exports = router;
