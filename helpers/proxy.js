@@ -1,91 +1,50 @@
 const axios = require("axios");
 
-const buildUpstreamUrl = (baseUrl, originalUrl) => {
-  const serviceBase = String(baseUrl || "").trim();
-  const requestPath = String(originalUrl || "/");
-
-  if (!serviceBase) {
-    throw new Error("Service base URL is missing.");
-  }
-
-  const upstream = new URL(serviceBase);
-  const configuredPath = upstream.pathname.replace(/\/+$/, "") || "/";
-  const requestUrl = new URL(requestPath, "http://gateway.local");
-  const requestPathname = requestUrl.pathname;
-
-  if (configuredPath !== "/" && requestPathname === configuredPath) {
-    upstream.pathname = requestPathname;
-  } else if (configuredPath !== "/" && requestPathname.startsWith(`${configuredPath}/`)) {
-    upstream.pathname = requestPathname;
-  } else {
-    upstream.pathname = `${configuredPath === "/" ? "" : configuredPath}${requestPathname}`.replace(/\/+/g, "/");
-  }
-
-  upstream.search = requestUrl.search;
-  return upstream.toString();
-};
-
-const shouldForwardBody = (req) => {
-  const contentType = String(req.headers["content-type"] || "");
-  return req.method !== "GET" && req.method !== "HEAD" && req.method !== "DELETE" && !contentType.startsWith("multipart/");
-};
-
 const proxyRequest = async ({ req, res, serviceUrl, serviceName }) => {
   try {
+    // Dynamically construct the target URL, preserving paths and query strings
+    const targetUrl = `${serviceUrl}${req.originalUrl}`;
+
+    // Filter out the 'host' header so the internal service doesn't reject it
     const headers = { ...req.headers };
     delete headers.host;
-    delete headers.connection;
-    delete headers["content-length"];
 
-    const targetUrl = buildUpstreamUrl(serviceUrl, req.originalUrl);
-    const requestConfig = {
+    const response = await axios({
       method: req.method,
       url: targetUrl,
-      headers,
-      validateStatus: () => true,
-      responseType: "json",
-      maxBodyLength: Infinity,
-      maxContentLength: Infinity,
-    };
+      data: req.method !== "GET" ? req.body : undefined,
+      headers: headers,
+      
+      // CRITICAL: Prevent Axios from internally following 301/302 redirects
+      maxRedirects: 0, 
+      
+      // CRITICAL: Treat redirects (300-302) as successful proxy responses
+      validateStatus: function (status) {
+        return status >= 200 && status <= 302;
+      },
+      
+      // OPTIONAL BUT RECOMMENDED: stream binary files properly if needed
+      responseType: "arraybuffer", 
+    });
 
-    if (req.method === "GET" || req.method === "HEAD") {
-      requestConfig.data = undefined;
-    } else if (req.headers["content-type"] && req.headers["content-type"].startsWith("multipart/")) {
-      requestConfig.data = req;
-    } else {
-      requestConfig.data = req.body;
-    }
+    // Forward all headers from the microservice back to the client
+    Object.entries(response.headers).forEach(([key, value]) => {
+      res.setHeader(key, value);
+    });
 
-    const response = await axios(requestConfig);
+    // Send the exact status code and data back to the browser
+    return res.status(response.status).send(response.data);
 
-    if (response.headers?.["set-cookie"]) {
-      res.setHeader("Set-Cookie", response.headers["set-cookie"]);
-    }
-
-    if (response.headers?.["content-type"] && !response.headers["content-type"].includes("application/json")) {
-      return res.status(response.status).set(response.headers).send(response.data);
-    }
-
-    return res.status(response.status).json(response.data);
   } catch (error) {
-    console.error(`${serviceName} gateway forwarding error:`, error.message);
-
-    if (error.code === "ECONNREFUSED" || error.code === "ECONNRESET") {
-      return res.status(503).json({
-        success: false,
-        message: `${serviceName} service is currently unreachable.`,
-      });
-    }
-
-    return res.status(500).json({
+    console.error(`[${serviceName} Proxy Error]:`, error.message);
+    
+    // Fallback error response if the microservice is completely unreachable
+    const statusCode = error.response ? error.response.status : 502;
+    return res.status(statusCode).json({
       success: false,
-      message: error.response?.data?.message || error.message || `${serviceName} gateway error`,
+      message: `${serviceName} service error: ${error.message}`,
     });
   }
 };
 
-module.exports = {
-  buildUpstreamUrl,
-  shouldForwardBody,
-  proxyRequest,
-};
+module.exports = { proxyRequest };
